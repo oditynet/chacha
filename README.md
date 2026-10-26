@@ -9,3 +9,11 @@ Launcher for android
     <td><img src="https://github.com/oditynet/chacha/blob/main/Screenshot_20261025-141508.png" width="300" height="auto" /></td>
   </tr>
 </table>
+
+
+# Версия
+
+0.2: 
+ - Добавил интерактивный календарь
+
+0.1: Релиз

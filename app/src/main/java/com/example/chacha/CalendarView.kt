@@ -1,5 +1,6 @@
 package com.example.chacha
 
+import android.animation.ValueAnimator
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -13,15 +14,17 @@ import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
 import android.view.View
+import android.view.animation.DecelerateInterpolator
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.min
 
 /**
- * Полупрозрачный виджет календаря текущего месяца.
- * Не принимает касания, обновляется автоматически
- * при смене даты/месяца через broadcast и периодический invalidate.
+ * Полупрозрачный виджет календаря.
+ * - Свайп влево/вправо — переключение месяцев.
+ * - Маленькая затемнённая кнопка в правом верхнем углу — возврат к текущему месяцу.
  */
 class CalendarView @JvmOverloads constructor(
     context: Context,
@@ -44,13 +47,25 @@ class CalendarView @JvmOverloads constructor(
         }
     }
 
-    // Фон календаря — чуть темнее, полупрозрачный, скруглённый
+    // ============================================================
+    //  ФОН ВСЕГО КАЛЕНДАРЯ (на весь вид)
+    // ============================================================
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(150, 0, 0, 0) // чёрный ~47% — затемняет подложку
+        color = Color.argb(120, 0, 0, 0)   // тёмный полупрозрачный фон (~78%)
         style = Paint.Style.FILL
     }
     private val bgRect = RectF()
 
+    // ============================================================
+    //  МАЛЕНЬКАЯ ПОДЛОЖКА КНОПКИ "ТЕКУЩИЙ МЕСЯЦ" (правый верх)
+    // ============================================================
+    private val resetBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(75, 0, 0, 0)
+        style = Paint.Style.FILL
+    }
+    private val resetBgRect = RectF()
+
+    // Кисти для текста
     private val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(180, 255, 255, 255)
         textAlign = Paint.Align.CENTER
@@ -84,8 +99,34 @@ class CalendarView @JvmOverloads constructor(
         }
     }
 
+    // --- Свайпы / смещение месяца ---
+
+    /** Сдвиг отображаемого месяца относительно текущего: 0 = текущий */
+    private var monthOffset: Int = 0
+
+    /** Горизонтальный сдвиг Canvas во время анимации перелистывания */
+    private var slideTranslationX: Float = 0f
+
+    private var slideAnimator: ValueAnimator? = null
+
+    private var touchStartX = 0f
+    private var touchStartY = 0f
+    private var touchLastX = 0f
+    private var isDragging = false
+    private var dragDirectionDecided = false
+
+    private val swipeThresholdPx = 80f * resources.displayMetrics.density
+
+    // --- Кнопка "текущий месяц" ---
+    private val resetHitRect = RectF()
+    private var resetTapCandidate = false
+    private var resetPressed = false
+    private val touchSlopPx = 16f * resources.displayMetrics.density
+
+    private var switched = false
+
     init {
-        isClickable = false
+        isClickable = true
         isFocusable = false
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
     }
@@ -95,6 +136,9 @@ class CalendarView @JvmOverloads constructor(
         if (receiver == null) {
             receiver = object : BroadcastReceiver() {
                 override fun onReceive(c: Context?, i: Intent?) {
+                    if (i?.action == Intent.ACTION_DATE_CHANGED) {
+                        monthOffset = 0
+                    }
                     invalidate()
                 }
             }
@@ -114,6 +158,7 @@ class CalendarView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         handler.removeCallbacks(tickRunnable)
+        slideAnimator?.cancel()
         receiver?.let {
             try { context.unregisterReceiver(it) } catch (_: Exception) {}
         }
@@ -121,7 +166,178 @@ class CalendarView @JvmOverloads constructor(
         super.onDetachedFromWindow()
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean = false
+    // --- Размеры и hit-зона кнопки "текущий месяц" ---
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        updateResetHitRect(w.toFloat(), h.toFloat())
+    }
+
+    /**
+     * Hit-зона кнопки — совпадает с её визуальным размером:
+     * ширина w/8, высота h/10, прижата к правому верхнему углу.
+     */
+    private fun updateResetHitRect(w: Float, h: Float) {
+        if (w <= 0f || h <= 0f) {
+            resetHitRect.setEmpty()
+            return
+        }
+        val hitW = w / 8f
+        val hitH = h / 10f
+        val margin = h * 0.02f
+        resetHitRect.set(
+            w - hitW - margin,
+            margin,
+            w - margin,
+            margin + hitH
+        )
+    }
+
+    // --- Жесты ---
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                touchStartX = event.x
+                touchStartY = event.y
+                touchLastX = event.x
+                isDragging = true
+                dragDirectionDecided = false
+                slideAnimator?.cancel()
+                slideTranslationX = 0f
+                resetTapCandidate = resetHitRect.contains(event.x, event.y)
+                resetPressed = resetTapCandidate
+                if (resetPressed) invalidate()
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!isDragging) return true
+                if (resetTapCandidate) {
+                    val dxTotal = event.x - touchStartX
+                    val dyTotal = event.y - touchStartY
+                    if (abs(dxTotal) > touchSlopPx || abs(dyTotal) > touchSlopPx) {
+                        resetTapCandidate = false
+                        if (resetPressed) {
+                            resetPressed = false
+                            invalidate()
+                        }
+                    }
+                }
+
+                val dx = event.x - touchStartX
+                val dy = event.y - touchStartY
+                if (!dragDirectionDecided) {
+                    if (abs(dx) > 16f && abs(dx) > abs(dy)) {
+                        dragDirectionDecided = true
+                    } else if (abs(dy) > 16f && abs(dy) > abs(dx)) {
+                        isDragging = false
+                        slideTranslationX = 0f
+                        resetTapCandidate = false
+                        resetPressed = false
+                        invalidate()
+                        return true
+                    }
+                }
+                if (dragDirectionDecided) {
+                    slideTranslationX = dx * 0.35f
+                    invalidate()
+                }
+                touchLastX = event.x
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!isDragging) {
+                    resetTapCandidate = false
+                    resetPressed = false
+                    invalidate()
+                    return true
+                }
+                isDragging = false
+
+                // Тап по кнопке "текущий месяц"
+                if (resetTapCandidate && event.actionMasked == MotionEvent.ACTION_UP) {
+                    resetTapCandidate = false
+                    resetPressed = false
+                    slideAnimator?.cancel()
+                    slideTranslationX = 0f
+                    if (monthOffset != 0) {
+                        monthOffset = 0
+                    }
+                    invalidate()
+                    return true
+                }
+                resetTapCandidate = false
+                if (resetPressed) {
+                    resetPressed = false
+                    invalidate()
+                }
+
+                // Свайп
+                val dx = event.x - touchStartX
+                if (dragDirectionDecided && abs(dx) >= swipeThresholdPx) {
+                    if (dx < 0) goToNextMonth() else goToPrevMonth()
+                } else {
+                    slideTranslationX = 0f
+                    invalidate()
+                }
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    private fun goToNextMonth() {
+        animateMonthChange(+1)
+    }
+
+    private fun goToPrevMonth() {
+        animateMonthChange(-1)
+    }
+
+    private fun animateMonthChange(direction: Int) {
+        slideAnimator?.cancel()
+        val w = width.toFloat().coerceAtLeast(1f)
+        val exitTo = -direction * w
+        val enterFrom = direction * w
+
+        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 260L
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { anim ->
+                val t = anim.animatedFraction
+                slideTranslationX = if (t < 0.5f) {
+                    exitTo * (t / 0.5f)
+                } else {
+                    enterFrom * (1f - (t - 0.5f) / 0.5f)
+                }
+                if (t >= 0.5f && !switched) {
+                    switched = true
+                    monthOffset += direction
+                }
+                invalidate()
+            }
+        }
+
+        var cancelled = false
+        animator.addListener(object : android.animation.Animator.AnimatorListener {
+            override fun onAnimationStart(animation: android.animation.Animator) {}
+            override fun onAnimationEnd(animation: android.animation.Animator) {
+                if (!cancelled) {
+                    slideTranslationX = 0f
+                    switched = false
+                    invalidate()
+                }
+            }
+            override fun onAnimationCancel(animation: android.animation.Animator) {
+                cancelled = true
+            }
+            override fun onAnimationRepeat(animation: android.animation.Animator) {}
+        })
+
+        switched = false
+        slideAnimator = animator
+        animator.start()
+    }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val w = MeasureSpec.getSize(widthMeasureSpec)
@@ -129,6 +345,9 @@ class CalendarView @JvmOverloads constructor(
         setMeasuredDimension(w, h)
     }
 
+    // ============================================================
+    //  ОТРИСОВКА
+    // ============================================================
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
@@ -136,18 +355,51 @@ class CalendarView @JvmOverloads constructor(
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
 
-        // --- Тёмный полупрозрачный фон со скруглением ---
+        // ------------------------------------------------------------
+        //  1. ФОН ВСЕГО КАЛЕНДАРЯ — на весь вид (0,0 → w,h)
+        // ------------------------------------------------------------
         val corner = h * 0.10f
         bgRect.set(0f, 0f, w, h)
         canvas.drawRoundRect(bgRect, corner, corner, bgPaint)
 
-        val now = Calendar.getInstance(locale)
-        val year = now.get(Calendar.YEAR)
-        val month = now.get(Calendar.MONTH)
-        val today = now.get(Calendar.DAY_OF_MONTH)
+        // ------------------------------------------------------------
+        //  2. МАЛЕНЬКАЯ ПОДЛОЖКА КНОПКИ — в правом верхнем углу
+        //     Ширина w/8, высота h/10. Рисуется ПОВЕРХ фона,
+        //     но ДО canvas.translate(), чтобы не уезжать при свайпе.
+        // ------------------------------------------------------------
+        if (!resetHitRect.isEmpty) {
+            resetBgRect.set(resetHitRect)
+            val r = (resetHitRect.height()) * 0.35f
+            resetBgPaint.color = if (resetPressed) {
+                Color.argb(130, 0, 0, 0)
+            } else {
+                Color.argb(80, 0, 0, 0)
+            }
+            canvas.drawRoundRect(resetBgRect, r, r, resetBgPaint)
+        }
+
+        // ------------------------------------------------------------
+        //  3. СЕТКА ДНЕЙ (сдвигается при анимации свайпа)
+        // ------------------------------------------------------------
+        canvas.save()
+        canvas.translate(slideTranslationX, 0f)
+
+        val realNow = Calendar.getInstance(locale)
+        val todayYear = realNow.get(Calendar.YEAR)
+        val todayMonth = realNow.get(Calendar.MONTH)
+        val todayDay = realNow.get(Calendar.DAY_OF_MONTH)
+
+        val shown = Calendar.getInstance(locale).apply {
+            clear()
+            set(todayYear, todayMonth, 1)
+            add(Calendar.MONTH, monthOffset)
+        }
+        val year = shown.get(Calendar.YEAR)
+        val month = shown.get(Calendar.MONTH)
+        val isCurrentMonth = (monthOffset == 0)
 
         val df = SimpleDateFormat("LLLL yyyy", locale)
-        val monthTitle = df.format(now.time).replaceFirstChar { it.uppercaseChar() }
+        val monthTitle = df.format(shown.time).replaceFirstChar { it.uppercaseChar() }
 
         val padH = w * 0.05f
         val padV = h * 0.06f
@@ -165,7 +417,7 @@ class CalendarView @JvmOverloads constructor(
             canvas.drawText(weekDays[i], x, headerY, headerPaint)
         }
 
-        // Первое число месяца
+        // Первое число отображаемого месяца
         val firstOfMonth = Calendar.getInstance(locale).apply {
             clear()
             set(year, month, 1)
@@ -190,8 +442,9 @@ class CalendarView @JvmOverloads constructor(
             val cx = padH + colW * (col + 0.5f)
             val cy = gridTop + rowH * (row + 0.5f)
 
-            if (day == today) {
-                val r = min(colW, rowH) * 0.42f
+            val highlight = isCurrentMonth && day == todayDay
+            if (highlight) {
+                val r = min(colW, rowH) * 0.60f
                 canvas.drawCircle(cx, cy, r, todayBgPaint)
                 val fm = todayTextPaint.fontMetrics
                 val baseline = cy - (fm.ascent + fm.descent) / 2f
@@ -202,5 +455,7 @@ class CalendarView @JvmOverloads constructor(
                 canvas.drawText(day.toString(), cx, baseline, dayPaint)
             }
         }
+
+        canvas.restore()
     }
 }
